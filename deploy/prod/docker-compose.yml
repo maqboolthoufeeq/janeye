@@ -1,0 +1,329 @@
+version: '3.9'
+
+services:
+  postgres-primary:
+    image: postgres:16-alpine
+    container_name: fastapi_postgres_primary
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+      POSTGRES_REPLICATION_MODE: master
+      POSTGRES_REPLICATION_USER: ${DB_REPLICATION_USER}
+      POSTGRES_REPLICATION_PASSWORD: ${DB_REPLICATION_PASSWORD}
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf
+    networks:
+      - fastapi_network_prod
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '2'
+          memory: 2G
+
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: fastapi_postgres_replica
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_REPLICATION_MODE: slave
+      POSTGRES_MASTER_HOST: postgres-primary
+      POSTGRES_MASTER_PORT: 5432
+      POSTGRES_REPLICATION_USER: ${DB_REPLICATION_USER}
+      POSTGRES_REPLICATION_PASSWORD: ${DB_REPLICATION_PASSWORD}
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+    networks:
+      - fastapi_network_prod
+    depends_on:
+      - postgres-primary
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  redis-master:
+    image: redis:7-alpine
+    container_name: fastapi_redis_master
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD}
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+    volumes:
+      - redis_master_data:/data
+    networks:
+      - fastapi_network_prod
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  redis-slave:
+    image: redis:7-alpine
+    container_name: fastapi_redis_slave
+    command: >
+      redis-server
+      --replicaof redis-master 6379
+      --masterauth ${REDIS_PASSWORD}
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+    networks:
+      - fastapi_network_prod
+    depends_on:
+      - redis-master
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: fastapi_rabbitmq_prod
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-/}
+      RABBITMQ_VM_MEMORY_HIGH_WATERMARK: "0.6"
+      RABBITMQ_DISK_FREE_LIMIT: "5GB"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    networks:
+      - fastapi_network_prod
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  app:
+    build:
+      context: ../../back
+      dockerfile: build/prod/fastapi/Dockerfile
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+    image: fastapi-app:prod-${VERSION:-latest}
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql+asyncpg://${DB_USER}:${DB_PASSWORD}@postgres-primary:5432/${DB_NAME}
+      - DATABASE_READ_URL=postgresql+asyncpg://${DB_USER}:${DB_PASSWORD}@postgres-replica:5432/${DB_NAME}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis-master:6379/0
+      - REDIS_READ_URL=redis://:${REDIS_PASSWORD}@redis-slave:6379/0
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      - SECRET_KEY=${SECRET_KEY}
+      - DEBUG=False
+      - LOG_LEVEL=WARNING
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - SENTRY_DSN=${SENTRY_DSN}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+    networks:
+      - fastapi_network_prod
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: >
+      sh -c "
+        echo 'Running database migrations...' &&
+        alembic upgrade head &&
+        echo 'Starting application...' &&
+        gunicorn main:app
+          -w ${WORKERS:-4}
+          -k uvicorn.workers.UvicornWorker
+          --bind 0.0.0.0:8000
+          --max-requests 1000
+          --max-requests-jitter 50
+          --access-logfile -
+          --error-logfile -
+          --worker-class uvicorn.workers.UvicornWorker
+      "
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 3
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+        monitor: 60s
+        max_failure_ratio: 0.3
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  celery_worker:
+    build:
+      context: ../../back
+      dockerfile: build/prod/celery/Dockerfile
+    image: fastapi-celery:prod-${VERSION:-latest}
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql+asyncpg://${DB_USER}:${DB_PASSWORD}@postgres-primary:5432/${DB_NAME}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis-master:6379/0
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      - LOG_LEVEL=WARNING
+      - SENTRY_DSN=${SENTRY_DSN}
+    networks:
+      - fastapi_network_prod
+    depends_on:
+      - rabbitmq
+      - redis-master
+      - postgres-primary
+    command: >
+      celery -A app.tasks.celery_app worker
+        --loglevel=warning
+        --concurrency=${CELERY_WORKERS:-4}
+        --max-tasks-per-child=1000
+        --time-limit=300
+        --soft-time-limit=240
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 2
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  celery_beat:
+    build:
+      context: ../../back
+      dockerfile: build/prod/celery/Dockerfile
+    image: fastapi-celery:prod-${VERSION:-latest}
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql+asyncpg://${DB_USER}:${DB_PASSWORD}@postgres-primary:5432/${DB_NAME}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis-master:6379/0
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      - LOG_LEVEL=WARNING
+      - SENTRY_DSN=${SENTRY_DSN}
+    networks:
+      - fastapi_network_prod
+    depends_on:
+      - rabbitmq
+      - redis-master
+      - postgres-primary
+    command: celery -A app.tasks.celery_app beat --loglevel=warning
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  nginx:
+    image: nginx:alpine
+    container_name: fastapi_nginx_prod
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/prod.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx_cache:/var/cache/nginx
+    networks:
+      - fastapi_network_prod
+    depends_on:
+      - app
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+networks:
+  fastapi_network_prod:
+    driver: overlay
+    attachable: true
+    driver_opts:
+      encrypted: "true"
+
+volumes:
+  postgres_primary_data:
+  postgres_replica_data:
+  redis_master_data:
+  rabbitmq_data:
+  nginx_cache:

@@ -1,0 +1,198 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fastapi_postgres_dev
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-devuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpass}
+      POSTGRES_DB: ${POSTGRES_DB:-fastapi_dev}
+    ports:
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - fastapi_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-devuser} -d ${POSTGRES_DB:-fastapi_dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: fastapi_redis_dev
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - fastapi_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: fastapi_rabbitmq_dev
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-devuser}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-devpass}
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - fastapi_network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: fastapi_mailpit_dev
+    ports:
+      - "127.0.0.1:${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "127.0.0.1:${MAILPIT_WEB_PORT:-8025}:8025"
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+    volumes:
+      - mailpit_data:/data
+    networks:
+      - fastapi_network
+
+  minio:
+    image: minio/minio:latest
+    container_name: fastapi_minio_dev
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - fastapi_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  app:
+    build:
+      context: ../../back
+      dockerfile: build/dev/fastapi/Dockerfile
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+    container_name: fastapi_app_dev
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=dev
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-devuser}:${POSTGRES_PASSWORD:-devpass}@postgres:5432/${POSTGRES_DB:-fastapi_dev}
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-devuser}:${RABBITMQ_PASSWORD:-devpass}@rabbitmq:5672/
+      - SMTP_HOST=mailpit
+      - SMTP_PORT=1025
+      - MINIO_ENDPOINT=minio:9000
+      - RUN_MIGRATIONS=true
+      - CREATE_SUPERUSER=${CREATE_SUPERUSER:-false}
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    volumes:
+      - ../../back:/app:cached
+      - /app/.venv  # Exclude .venv from sync
+    networks:
+      - fastapi_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  celery_worker:
+    build:
+      context: ../../back
+      dockerfile: build/dev/celery/Dockerfile
+    container_name: fastapi_celery_worker_dev
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=dev
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-devuser}:${POSTGRES_PASSWORD:-devpass}@postgres:5432/${POSTGRES_DB:-fastapi_dev}
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-devuser}:${RABBITMQ_PASSWORD:-devpass}@rabbitmq:5672/
+    volumes:
+      - ../../back:/app:cached
+      - /app/.venv
+    networks:
+      - fastapi_network
+    depends_on:
+      - rabbitmq
+      - redis
+      - postgres
+
+  celery_beat:
+    build:
+      context: ../../back
+      dockerfile: build/dev/celery/Dockerfile
+    container_name: fastapi_celery_beat_dev
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=dev
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-devuser}:${POSTGRES_PASSWORD:-devpass}@postgres:5432/${POSTGRES_DB:-fastapi_dev}
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-devuser}:${RABBITMQ_PASSWORD:-devpass}@rabbitmq:5672/
+    volumes:
+      - ../../back:/app:cached
+      - /app/.venv
+      - celerybeat_data:/app/celerybeat
+    networks:
+      - fastapi_network
+    depends_on:
+      - rabbitmq
+      - redis
+      - postgres
+    command: celery -A app.tasks.celery_app beat --loglevel=debug
+
+  flower:
+    image: mher/flower:latest
+    container_name: fastapi_flower_dev
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/3
+      FLOWER_PORT: 5555
+      FLOWER_UNAUTHENTICATED_API: "true"
+    ports:
+      - "127.0.0.1:${FLOWER_PORT:-5555}:5555"
+    networks:
+      - fastapi_network
+    depends_on:
+      - rabbitmq
+      - celery_worker
+
+networks:
+  fastapi_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  minio_data:
+  mailpit_data:
+  celerybeat_data:
